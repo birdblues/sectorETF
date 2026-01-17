@@ -6,7 +6,7 @@ import re
 import json
 import datetime as dt
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any
 
 import requests
 from bs4 import BeautifulSoup
@@ -24,8 +24,8 @@ SOURCE_URLS = {
     "XLV": "https://www.ssga.com/us/en/individual/etfs/state-street-healthcare-select-sector-spdr-etf-xlv",
     "XLI": "https://www.ssga.com/us/en/individual/etfs/state-street-industrial-select-sector-spdr-etf-xli",
     "XLB": "https://www.ssga.com/us/en/individual/etfs/state-street-materials-select-sector-spdr-etf-xlb",
-    "XLK": "https://www.ssga.com/us/en/individual/etfs/funds/technology-select-sector-spdr-fund-xlk",
-    "XLU": "https://www.ssga.com/us/en/individual/etfs/state-street-utilities-select-sector-spdr-etf-xlu",  # FIXED
+    "XLK": "https://www.ssga.com/us/en/individual/etfs/state-street-technology-select-sector-spdr-etf-xlk",
+    "XLU": "https://www.ssga.com/us/en/individual/etfs/state-street-utilities-select-sector-spdr-etf-xlu",
     "XLRE": "https://www.ssga.com/us/en/individual/etfs/state-street-real-estate-select-sector-spdr-etf-xlre",
 }
 
@@ -38,41 +38,47 @@ HEADERS = {
 }
 
 # number + optional suffix (B/M/K)
-AMT_RE = re.compile(r"([-+]?\$?\s?\d[\d,]*\.?\d*)\s*([BbMmKk])?")
+AMT_RE = re.compile(r"\$?\s*([\d,]+(?:\.\d+)?)\s*([BbMmKk])\b")
 
-def parse_amount(s: str) -> Optional[float]:
-    if not s:
-        return None
-    m = AMT_RE.search(s)
-    if not m:
-        return None
-    num = m.group(1).replace("$", "").replace(",", "").strip()
-    unit = (m.group(2) or "").upper()
 
+def unit_to_mult(unit: str) -> float:
+    u = unit.upper()
+    return {"K": 1e3, "M": 1e6, "B": 1e9}.get(u, 1.0)
+
+
+def parse_unit_amount(num: str, unit: str) -> Optional[float]:
     try:
-        x = float(num)
+        x = float(num.replace(",", ""))
     except ValueError:
         return None
-
-    mult = {"K": 1e3, "M": 1e6, "B": 1e9}.get(unit, 1.0)
-    return x * mult
+    return x * unit_to_mult(unit)
 
 
-def find_value_near_label(text: str, label_patterns: Tuple[str, ...]) -> Optional[float]:
-    lower = text.lower()
-    for pat in label_patterns:
-        idx = lower.find(pat.lower())
-        if idx >= 0:
-            window = text[idx : idx + 600]
-            val = parse_amount(window)
-            if val is not None:
-                return val
-    return None
+def extract_asof_date(text: str) -> Optional[dt.date]:
+    """
+    Prefer 'Fund Net Asset Value as of <Mon> <DD> <YYYY>' date.
+    Falls back to other 'As of ...' formats if present.
+    """
+    t = re.sub(r"\s+", " ", text)
 
+    # Most specific: "Fund Net Asset Value as of Jan 15 2026"
+    m = re.search(
+        r"Fund Net Asset Value as of\s+([A-Za-z]{3}\s+\d{1,2}\s+\d{4})",
+        t,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        try:
+            return dt.datetime.strptime(m.group(1), "%b %d %Y").date()
+        except ValueError:
+            pass
 
-def try_parse_asof_date(text: str) -> Optional[dt.date]:
-    # Very light heuristic; if not found, falls back to UTC date
-    m = re.search(r"As of\s+([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})", text)
+    # Generic: "As of Jan 15, 2026" or "As of Jan 15 2026"
+    m = re.search(
+        r"As of\s+([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})",
+        t,
+        flags=re.IGNORECASE,
+    )
     if m:
         raw = m.group(1).replace(",", "")
         for fmt in ("%b %d %Y", "%B %d %Y"):
@@ -81,7 +87,8 @@ def try_parse_asof_date(text: str) -> Optional[dt.date]:
             except ValueError:
                 pass
 
-    m = re.search(r"As of\s+(\d{1,2}/\d{1,2}/\d{4})", text)
+    # Numeric: "As of 01/15/2026"
+    m = re.search(r"As of\s+(\d{1,2}/\d{1,2}/\d{4})", t, flags=re.IGNORECASE)
     if m:
         try:
             return dt.datetime.strptime(m.group(1), "%m/%d/%Y").date()
@@ -91,11 +98,47 @@ def try_parse_asof_date(text: str) -> Optional[dt.date]:
     return None
 
 
-def dig_for_numbers(obj: Any) -> str:
+def extract_labeled_amount(text: str, label: str) -> Optional[float]:
+    """
+    Extract an amount like:
+      "<label>  $93,602.55 M"
+      "<label>  643.66 M"
+    """
+    t = re.sub(r"\s+", " ", text)
+    m = re.search(rf"{re.escape(label)}\s+{AMT_RE.pattern}", t, flags=re.IGNORECASE)
+    if not m:
+        return None
+    # groups: (num, unit) because AMT_RE pattern is embedded
+    num = m.group(1)
+    unit = m.group(2)
+    return parse_unit_amount(num, unit)
+
+
+def extract_nav(text: str) -> Optional[float]:
+    """
+    Try to extract NAV value: "... NAV ... $145.42"
+    """
+    t = re.sub(r"\s+", " ", text)
+    m = re.search(r"\bNAV\b.{0,200}?\$\s*([\d,]+(?:\.\d+)?)", t, flags=re.IGNORECASE)
+    if not m:
+        # fallback: "Net Asset Value ... $145.42"
+        m = re.search(r"Net Asset Value.{0,200}?\$\s*([\d,]+(?:\.\d+)?)", t, flags=re.IGNORECASE)
+    if not m:
+        return None
     try:
-        return json.dumps(obj, ensure_ascii=False)
-    except Exception:
-        return ""
+        return float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def dig_next_data(soup: BeautifulSoup) -> Optional[dict]:
+    tag = soup.find("script", id="__NEXT_DATA__")
+    if tag and tag.string:
+        try:
+            return json.loads(tag.string)
+        except Exception:
+            return None
+    return None
 
 
 @dataclass
@@ -125,36 +168,25 @@ def fetch_snapshot(url: str) -> EtfSnapshot:
     soup = BeautifulSoup(html, "html.parser")
 
     text = soup.get_text(" ", strip=True)
-    asof = try_parse_asof_date(text) or dt.datetime.utcnow().date()
 
-    # Try Next.js JSON blob first (more stable if present)
-    next_data = None
-    s = soup.find("script", id="__NEXT_DATA__")
-    if s and s.string:
-        try:
-            next_data = json.loads(s.string)
-        except Exception:
-            next_data = None
+    # Prefer stable extraction from human-readable text (SSGA has the labeled blocks)
+    asof = extract_asof_date(text) or dt.datetime.utcnow().date()
+    nav = extract_nav(text)
 
-    hay = text
-    raw_payload: Dict[str, Any] = {}
+    # These are the key fixes for your None issue:
+    shares = extract_labeled_amount(text, "Shares Outstanding")
+    aum = extract_labeled_amount(text, "Assets Under Management") or extract_labeled_amount(text, "Net Assets")
 
-    if next_data is not None:
-        raw_payload["next_data_present"] = True
-        raw_payload["next_data_keys"] = list(next_data.keys())
-        hay = hay + " " + dig_for_numbers(next_data)
-    else:
-        raw_payload["next_data_present"] = False
+    # Optional: include NEXT_DATA existence for debugging
+    nd = dig_next_data(soup)
 
-    nav = find_value_near_label(hay, ("NAV", "Net Asset Value"))
-    aum = find_value_near_label(hay, ("Net Assets", "AUM", "Total Net Assets", "Total net assets"))
-    shares = find_value_near_label(hay, ("Shares Outstanding", "Shares out", "Shares outstanding"))
-
-    raw_payload.update({
-        "nav_guess": nav,
-        "aum_guess": aum,
-        "shares_guess": shares,
-    })
+    raw_payload: Dict[str, Any] = {
+        "nav": nav,
+        "aum": aum,
+        "shares": shares,
+        "next_data_present": bool(nd),
+        "url": url,
+    }
 
     return EtfSnapshot(
         asof_date=asof,
@@ -198,7 +230,10 @@ def main():
         try:
             snap = fetch_snapshot(url)
             upsert_daily(sb, t, snap)
-            print(f"[OK] {t} asof={snap.asof_date} nav={snap.nav} aum={snap.aum} shares={snap.shares_outstanding}")
+            print(
+                f"[OK] {t} asof={snap.asof_date} "
+                f"nav={snap.nav} aum={snap.aum} shares={snap.shares_outstanding}"
+            )
         except Exception as e:
             print(f"[ERR] {t} {e}")
 
