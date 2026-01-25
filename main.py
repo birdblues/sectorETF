@@ -13,7 +13,7 @@ from bs4 import BeautifulSoup
 from supabase import create_client, Client
 
 
-TICKERS = ["XLC", "XLY", "XLP", "XLE", "XLF", "XLV", "XLI", "XLB", "XLK", "XLU", "XLRE"]
+TICKERS = ["XLC", "XLY", "XLP", "XLE", "XLF", "XLV", "XLI", "XLB", "XLK", "XLU", "XLRE", "GLD", "SPAB", "SPY"]
 
 SOURCE_URLS = {
     "XLC": "https://www.ssga.com/us/en/individual/etfs/state-street-communication-services-select-sector-spdr-etf-xlc",
@@ -27,6 +27,9 @@ SOURCE_URLS = {
     "XLK": "https://www.ssga.com/us/en/individual/etfs/state-street-technology-select-sector-spdr-etf-xlk",
     "XLU": "https://www.ssga.com/us/en/individual/etfs/state-street-utilities-select-sector-spdr-etf-xlu",
     "XLRE": "https://www.ssga.com/us/en/individual/etfs/state-street-real-estate-select-sector-spdr-etf-xlre",
+    "GLD": "https://www.ssga.com/us/en/individual/etfs/spdr-gold-shares-gld",
+    "SPAB": "https://www.ssga.com/us/en/individual/etfs/state-street-spdr-portfolio-aggregate-bond-etf-spab",
+    "SPY": "https://www.ssga.com/us/en/individual/etfs/state-street-spdr-sp-500-etf-trust-spy",
 }
 
 HEADERS = {
@@ -218,6 +221,9 @@ def upsert_daily(sb: Client, ticker: str, snap: EtfSnapshot) -> None:
 
 
 def main():
+    # import dotenv
+    # dotenv.load_dotenv()
+
     sb = supabase_client()
 
     missing = []
